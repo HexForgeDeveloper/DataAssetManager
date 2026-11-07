@@ -1,0 +1,1553 @@
+// Copyright (c) 2026 DimAlek. All Rights Reserved.
+
+#include "UI/SDataAssetManagerWidget.h"
+#include "Services/DataAssetRegistrySubscription.h"
+#include "UI/DataAssetCreationWindow.h"
+#include "UI/DataAssetDiffWindow.h"
+#include "UI/DataAssetMoveWindow.h"
+#include "UI/DataAssetReferenceInspectorWindow.h"
+#include "Widgets/SWidget.h"
+#include "Interfaces/IPluginManager.h"
+#include "SourceControlHelpers.h"
+#include "SPositiveActionButton.h"
+#include "Algo/Transform.h"
+#include "Algo/AnyOf.h"
+#include "UI/SDataAssetTableRow.h"
+#include "DataAssetManager.h"
+#include "HAL/PlatformApplicationMisc.h"
+#include "SlateBasics.h"
+#include "SlateExtras.h"
+#include "Widgets/Images/SLayeredImage.h"
+#include "Menu/DataAssetManagerMenu.h"
+#include "UObject/MetaData.h"
+#include "SMetaDataView.h"
+#include "UObject/ObjectSaveContext.h"
+#include "UObject/SavePackage.h"
+#include "AssetManagerEditorModule.h"
+#include "ContentBrowserModule.h"
+#include "DeveloperSettings/DataAssetManagerSettings.h"
+#include "Editor/UnrealEd/Classes/Factories/DataAssetFactory.h"
+#include "Filters/SFilterSearchBox.h"
+#include "IContentBrowserSingleton.h"
+#include "ISettingsModule.h"
+#include "MessageLogModule.h"
+#include "ObjectTools.h"
+#include "OutputLogModule.h"
+#include "ToolMenus.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "WidgetDrawerConfig.h"
+#include "Editor/ContentBrowser/Private/ContentBrowserSingleton.h"
+#include "FunctionLibrary/DataAssetManagerFunctionLibrary.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "Logging/DataAssetManagerLog.h"
+#include "Customization/DetailsRootObjectCustomization.h"
+#include "Customization/DataAssetDetailsExtensionHandler.h"
+#include "Models/DataAssetListModel.h"
+#include "Services/DataAssetManagerAssetService.h"
+#include "Styling/SlateIconFinder.h"
+
+#define LOCTEXT_NAMESPACE "SDataAssetManagerWidget"
+
+DEFINE_LOG_CATEGORY(SDataAssetManagerWidgetLog);
+
+namespace DataAssetManager
+{
+	inline constexpr float ItemHeigth = 24.0f;
+	inline constexpr float DataAssetFontSize = 10.0f;
+	inline constexpr float SearchBoxHideThreshold = 0.01f;
+	inline constexpr float DefaultSplitterValueWhenVisible = 0.25f;
+	inline constexpr float SplitterValueWhenHidden = 0.0f;
+	inline constexpr float ExpireDuration = 3.0f;
+	inline constexpr float MetaDataWindowWidth = 500.0f;
+	inline constexpr float MetaDataWindowHeight = 250.0f;
+	inline constexpr float RCFixedWidth = 30.0f;
+
+	const FMargin SeparatorPadding = FMargin(5.f, 7.f);
+} // namespace DataAssetManager
+
+/* clang-format off */
+void SDataAssetManagerWidget::Construct(const FArguments& InArgs)
+{
+	bCanSupportFocus = true;
+
+	SubscribeToAssetRegistryEvent();
+	LoadDataAssets(DataAssetManager::GetPluginSettings());
+	UpdateFilteredAssetList();
+	InitializeAssetTypeComboBox(AssetManagerData.FilteredDataAssets);
+	InitializeTextFontInfo();
+	CreateDetailsView();
+
+	FSlateFontInfo BigFont = FAppStyle::Get().GetFontStyle("NormalText");
+	BigFont.Size = 32;
+
+	AssetManagerWidgets.MenuBar = FDataAssetManagerMenuFactory::CreateMenuBar(SharedThis(this));
+	TSharedPtr<SLayeredImage> FilterImage = CreateFilterImage();
+
+	ColumnData.InitializeColumnOrder();
+	InitializeColumnAdders();
+
+	AssetManagerWidgets.DetailsView->SetRootObjectCustomizationInstance(MakeShared<FDetailsRootObjectCustomization>());
+
+	/* CONTENT SPLITTER SECTION */
+	TSharedPtr<SSplitter> ContentSplitter = SAssignNew(AssetManagerWidgets.Splitter, SSplitter)
+											.Orientation(EOrientation::Orient_Horizontal);
+
+	ContentSplitter->AddSlot()
+		.Value_Lambda([&]() { return SplitterValue.Get(); })
+		.OnSlotResized(SSplitter::FOnSlotResized::CreateLambda([this](float NewSize) { SplitterValue.Set(NewSize); }))
+		[
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot()
+			.Padding(2.0f, 6.0f, 0.0f, 6.0f)
+			.AutoHeight()
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot()
+				.FillWidth(1.0f)
+				.Padding(4.0f, 0.0f, 4.0f, 0.0f)
+				[
+					SNew(SMenuAnchor)
+					.Placement(EMenuPlacement::MenuPlacement_ComboBoxRight)
+					[
+						SAssignNew(AssetManagerWidgets.ListViewSearchBox, SFilterSearchBox)
+						.HintText(LOCTEXT("SearchDetailsHint", "Search"))
+						.Cursor(EMouseCursor::Hand)
+						.OnTextChanged(this, &SDataAssetManagerWidget::OnSearchTextChanged)
+						.DelayChangeNotificationsWhileTyping(true)
+						.AddMetaData<FTagMetaData>(TEXT("Details.Search"))
+						.Visibility_Raw(this, &SDataAssetManagerWidget::GetVisibilitySearchBox)
+					]
+				]
+
+				+ SHorizontalBox::Slot()
+				.HAlign(HAlign_Right)
+				.AutoWidth()
+				.Padding(4.0f, 0.0f, 0.0f, 0.0f)
+				[
+					SAssignNew(AssetManagerWidgets.ComboButton, SComboButton)
+					.ComboButtonStyle(&FAppStyle::Get().GetWidgetStyle<FComboButtonStyle>("SimpleComboButtonWithIcon"))
+					.ForegroundColor(FSlateColor::UseStyle())
+					.ContentPadding(FMargin(1, 0))
+					.ButtonContent()[FilterImage.ToSharedRef()]
+					.MenuContent()
+					[
+						CreateComboButtonContent()
+					]
+				]
+			]
+
+			+ SVerticalBox::Slot()
+			[
+				SAssignNew(AssetManagerWidgets.AssetListView, SListView<TSharedPtr<FAssetData>>)
+				.ListItemsSource(&AssetManagerData.FilteredDataAssets)
+				.OnGenerateRow(this, &SDataAssetManagerWidget::GenerateAssetListRow)
+				.OnSelectionChanged(this, &SDataAssetManagerWidget::OnAssetSelected)
+				.SelectionMode(ESelectionMode::Multi)
+				.HeaderRow(GenerateHeaderRow())
+			]
+
+			+ SVerticalBox::Slot()
+			.FillHeight(0.6f)
+			.AutoHeight()
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot()
+				.VAlign(VAlign_Center)
+				.AutoWidth()
+				[
+					SNew(STextBlock)
+					.Text_Lambda([this]()
+						{
+							return GetSelectedTextBlockInfo();
+						})
+				]
+			]
+		];
+
+	ContentSplitter->AddSlot()
+		.Value(0.6)
+		[
+			SNew(SOverlay)
+			+ SOverlay::Slot()
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				[
+					SNew(SBorder)
+					.BorderImage(FAppStyle::GetBrush("DetailsView.CategoryTop"))
+					.Padding(FMargin(8.0f, 4.0f))
+					.Visibility_Lambda([this]()
+						{
+							return GetAssetListSelectedItem().Num() > 1 ? EVisibility::Visible : EVisibility::Collapsed;
+						})
+					[
+						SNew(SHorizontalBox)
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.0f)
+						.VAlign(VAlign_Center)
+						[
+							SNew(STextBlock)
+							.Text_Lambda([this]()
+								{
+									return FText::Format(
+									LOCTEXT("BulkEditSelectionLabel", "Bulk Edit: {0} assets"),
+									FText::AsNumber(GetAssetListSelectedItem().Num()));
+								})
+						]
+
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SButton)
+							.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+							.ContentPadding(FMargin(4.0f, 2.0f))
+							.ToolTipText(LOCTEXT("OpenPropertyMatrixTooltip", "Open selected Data Assets in Property Matrix"))
+							.IsEnabled(this, &SDataAssetManagerWidget::CanOpenSelectedAssetsInPropertyEditor)
+							.OnClicked_Lambda([this]()
+								{
+									OpenSelectionInPropertyMatrix();
+									return FReply::Handled();
+								})
+							[
+								SNew(SHorizontalBox)
+								+ SHorizontalBox::Slot()
+								.AutoWidth()
+								.VAlign(VAlign_Center)
+								[
+									SNew(SImage)
+									.Image(FSlateIconFinder::FindIconBrushForClass(UDataAsset::StaticClass()))
+								]
+
+								+ SHorizontalBox::Slot()
+								.AutoWidth()
+								.VAlign(VAlign_Center)
+								.Padding(4.0f, 0.0f, 0.0f, 0.0f)
+								[
+									SNew(STextBlock)
+									.Text(LOCTEXT("OpenPropertyMatrixButton", "Property Matrix"))
+								]
+							]
+						]
+					]
+				]
+
+				+ SVerticalBox::Slot()
+				.FillHeight(1.0f)
+				[
+					AssetManagerWidgets.DetailsView.ToSharedRef()
+				]
+			]
+
+			+ SOverlay::Slot()
+			.HAlign(HAlign_Center)
+			.VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(TEXT("Select DataAsset")))
+				.Font(BigFont)
+				.ColorAndOpacity(FLinearColor::White)
+				.Visibility_Lambda([this]()
+					{
+						return IsDetailsViewEmpty()
+						? EVisibility::Visible
+						: EVisibility::Collapsed;
+					})
+			]
+		];
+
+	/* TOOLBAR BUTTONS SECTION */
+	TSharedRef<SHorizontalBox> ToolbarButtonsSection = SNew(SHorizontalBox);
+	ToolbarButtonsSection->AddSlot()
+		.AutoWidth()
+		.HAlign(HAlign_Center)
+		[
+			SNew(SButton)
+			.HAlign(HAlign_Center)
+			.VAlign(VAlign_Center)
+			.ContentPadding(FMargin(2))
+			.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+			.ToolTipText(LOCTEXT("SaveButtonTooltip", "Click to save changes."))
+			.OnClicked_Lambda([this]() { SaveDataAsset(); return FReply::Handled(); })
+			[
+				SNew(SImage)
+				.Cursor(EMouseCursor::Hand)
+				.Image(FAppStyle::Get().GetBrush("Icons.Save"))
+			]
+		];
+
+	ToolbarButtonsSection->AddSlot()
+		.AutoWidth()
+		.HAlign(HAlign_Left)
+		[
+			SNew(SButton)
+			.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+			.Cursor(EMouseCursor::Hand)
+			.HAlign(HAlign_Left)
+			.VAlign(VAlign_Center)
+			.ContentPadding(FMargin(2))
+			.ToolTipText(LOCTEXT("FindAssetToolTip", "Find asset in content browser"))
+			.OnClicked_Lambda([this]() { SyncContentBrowserToSelectedAsset(); return FReply::Handled(); })
+			[
+				SNew(SImage)
+				.Cursor(EMouseCursor::Hand)
+				.Image(FAppStyle::GetBrush("Icons.Search"))
+			]
+		];
+
+	ToolbarButtonsSection->AddSlot()
+		.AutoWidth()
+		.HAlign(HAlign_Left)
+		[
+			SNew(SPositiveActionButton)
+			.Icon(FAppStyle::Get().GetBrush("Icons.Plus"))
+			.Text(FText::FromString(TEXT("Add")))
+			.Cursor(EMouseCursor::Hand)
+			.ToolTipText(LOCTEXT("AddDataAssetTooltip", "Click to add a new Data Asset."))
+			.OnClicked_Lambda([this]() { CreateNewDataAsset(); return FReply::Handled(); })
+		];
+
+	ToolbarButtonsSection->AddSlot()
+		.AutoWidth()
+		.HAlign(HAlign_Left)
+		[
+			SNew(SPositiveActionButton)
+			.Icon(FAppStyle::Get().GetBrush("MainFrame.SaveAll"))
+			.Text(FText::FromString(TEXT("Save All")))
+			.Cursor(EMouseCursor::Hand)
+			.ToolTipText(LOCTEXT("SaveAllDataAsset", "Save All Data Assets"))
+			.OnClicked_Lambda([this]() { SaveAllData(); return FReply::Handled(); })
+		];
+
+	/* MAINBOX SECTION */
+	TSharedRef<SVerticalBox> MainBox = SNew(SVerticalBox);
+	MainBox->AddSlot()
+		.AutoHeight()
+		[
+			AssetManagerWidgets.MenuBar.ToSharedRef()
+		];
+
+	MainBox->AddSlot()
+		.AutoHeight()
+		[
+			SNew(SSeparator)
+			.Orientation(Orient_Vertical)
+			.Thickness(1.0f)
+			.ColorAndOpacity(FColor::Transparent)
+		];
+
+	MainBox->AddSlot()
+		.AutoHeight()
+		[
+			ToolbarButtonsSection
+		];
+
+	MainBox->AddSlot()
+		.AutoHeight()
+		[
+			SNew(SSeparator)
+			.Orientation(Orient_Vertical)
+			.Thickness(0.1f)
+			.ColorAndOpacity(FColor::Transparent)
+		];
+
+	MainBox->AddSlot()
+		[
+			ContentSplitter.ToSharedRef()
+		];
+
+	ChildSlot
+		[
+			SNew(SBorder)
+			.Padding(FMargin(5.0f))
+			.BorderBackgroundColor(FColor::Transparent)
+			.VAlign(VAlign_Fill)
+			.HAlign(HAlign_Fill)
+			[
+				MainBox
+			]
+		];
+
+	SelectFirstAssetIfAvailable();
+#pragma endregion Slate
+}
+
+
+void SDataAssetManagerWidget::SelectFirstAssetIfAvailable()
+{
+	if (AssetManagerData.FilteredDataAssets.Num() > 0)
+	{
+		AssetManagerWidgets.AssetListView->SetSelection(AssetManagerData.FilteredDataAssets[0]);
+		OnAssetSelected(AssetManagerData.FilteredDataAssets[0], ESelectInfo::Direct);
+	}
+}
+
+SDataAssetManagerWidget::~SDataAssetManagerWidget()
+{
+	RegistrySubscription.Reset();
+}
+
+void SDataAssetManagerWidget::CreateNewDataAsset()
+{
+	FDataAssetCreationWindow::Show();
+}
+
+/* clang-format on */
+
+void SDataAssetManagerWidget::OpenSelectedDataAssetInEditor()
+{
+	const UObject* AssetObject = AssetManagerData.SelectedAsset->GetAsset();
+	if (!IsValid(AssetObject))
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("Selected Asset Object is not valid "));
+		return;
+	}
+
+	const UDataAsset* DataAsset = CastChecked<UDataAsset>(AssetObject);
+	GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(DataAsset);
+}
+
+void SDataAssetManagerWidget::ToggleDataAssetListVisibility()
+{
+	bIsSlotVisible = !bIsSlotVisible;
+	SplitterValue.Set(bIsSlotVisible ? DataAssetManager::DefaultSplitterValueWhenVisible : DataAssetManager::SplitterValueWhenHidden);
+}
+
+void SDataAssetManagerWidget::OpenAuditAsset()
+{
+	if (!IsSelectedAssetValid())
+	{
+		return;
+	}
+
+	TArray<FName> SelectedAssetPackageNames;
+	for (const TSharedPtr<FAssetData>& Items : GetAssetListSelectedItem())
+	{
+		const FName PackageName = Items->PackageName;
+		SelectedAssetPackageNames.Add(PackageName);
+	}
+
+	IAssetManagerEditorModule::Get().OpenAssetAuditUI(SelectedAssetPackageNames);
+}
+
+void SDataAssetManagerWidget::ShowDocumentation()
+{
+	const FString& URL = GetDefault<UDataAssetManagerSettings>()->DocumentationURL;
+	if (!URL.IsEmpty())
+	{
+		FPlatformProcess::LaunchURL(*URL, nullptr, nullptr);
+	}
+	else
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("Documentation URL is not set in settings."));
+	}
+}
+
+void SDataAssetManagerWidget::SaveDataAsset()
+{
+	TArray<TSharedPtr<FAssetData>> AssetsToSave = GetAssetListSelectedItem();
+	if (AssetsToSave.Num() == 0 && AssetManagerData.SelectedAsset.IsValid())
+	{
+		AssetsToSave.Add(AssetManagerData.SelectedAsset);
+	}
+
+	if (AssetsToSave.Num() == 0)
+	{
+		IsSelectedAssetValid();
+		return;
+	}
+
+	const int32 SavedCount = FDataAssetManagerAssetService::SaveAssets(AssetsToSave);
+	if (SavedCount > 0 && IConsoleManager::Get().FindConsoleVariable(TEXT("ShowDebugDataAssetManager"))->GetBool())
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Log, TEXT("Saved %d selected Data Assets"), SavedCount);
+	}
+}
+
+void SDataAssetManagerWidget::SaveAllData()
+{
+	if (SaveAllDataAsset())
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Log, TEXT("Save All Data"));
+	}
+}
+
+void SDataAssetManagerWidget::SyncContentBrowserToSelectedAsset()
+{
+	if (!IsSelectedAssetValid())
+	{
+		return;
+	}
+
+	const FContentBrowserModule& ContentBrowserModule = FModuleManager::Get().LoadModuleChecked<FContentBrowserModule>(DataAssetManager::ModuleName::ContentBrowser);
+
+	ContentBrowserModule.Get().SyncBrowserToAssets({ *AssetManagerData.SelectedAsset });
+}
+
+void SDataAssetManagerWidget::CopyToClipboard(bool bCopyPaths)
+{
+	if (!IsSelectedAssetValid())
+	{
+		return;
+	}
+
+	const FString ClipboardText = FDataAssetManagerAssetService::BuildClipboardText({ AssetManagerData.SelectedAsset }, bCopyPaths);
+	FPlatformApplicationMisc::ClipboardCopy(*ClipboardText);
+}
+
+void SDataAssetManagerWidget::OpenReferenceViewer()
+{
+	if (!IsSelectedAssetValid())
+	{
+		return;
+	}
+
+	TArray<FAssetData> AssetDataArray{};
+	AssetDataArray.Add(*AssetManagerData.SelectedAsset.Get());
+
+	FDataAssetManagerAssetService::ProcessAssetData(AssetDataArray,
+		[](const TArray<FAssetIdentifier>& AssetIdentifiers) {
+			IAssetManagerEditorModule::Get().OpenReferenceViewerUI(AssetIdentifiers);
+		});
+}
+
+void SDataAssetManagerWidget::OpenReferenceInspector()
+{
+	if (IsSelectedAssetValid())
+	{
+		FSlateApplication::Get().AddWindow(FDataAssetReferenceInspectorWindow::Create(AssetManagerData.SelectedAsset));
+	}
+}
+
+void SDataAssetManagerWidget::OpenDataAssetDiff()
+{
+	const TArray<TSharedPtr<FAssetData>> SelectedAssets = GetAssetListSelectedItem();
+	if (SelectedAssets.Num() != 2)
+	{
+		FNotificationInfo Info(LOCTEXT("DataAssetDiffRequiresTwoAssets", "Select exactly two Data Assets to compare."));
+		Info.ExpireDuration = DataAssetManager::ExpireDuration;
+		FSlateNotificationManager::Get().AddNotification(Info);
+		return;
+	}
+
+	TSharedRef<FDataAssetDiffResult> DiffResult = MakeShared<FDataAssetDiffResult>(FDataAssetManagerAssetService::DiffAssets(SelectedAssets[0], SelectedAssets[1]));
+
+	if (!DiffResult->bComparable)
+	{
+		FNotificationInfo Info(DiffResult->IsEmptyErrorText()
+				? LOCTEXT("DataAssetDiffFailed", "Could not compare the selected Data Assets.")
+				: DiffResult->ErrorText);
+		Info.ExpireDuration = DataAssetManager::ExpireDuration;
+		FSlateNotificationManager::Get().AddNotification(Info);
+		return;
+	}
+
+	const TWeakPtr<IDetailsView> WeakDetails = AssetManagerWidgets.DetailsView;
+	FSimpleDelegate OnChanged = FSimpleDelegate::CreateLambda([WeakDetails]() {
+		if (const TSharedPtr<IDetailsView> Details = WeakDetails.Pin())
+		{
+			Details->ForceRefresh();
+		}
+	});
+
+	FSlateApplication::Get().AddWindow(FDataAssetDiffWindow::Create(DiffResult, OnChanged));
+}
+
+bool SDataAssetManagerWidget::CanOpenDataAssetDiff() const
+{
+	return GetAssetListSelectedItem().Num() == 2;
+}
+
+void SDataAssetManagerWidget::OpenSizeMap()
+{
+	if (!IsSelectedAssetValid())
+	{
+		return;
+	}
+
+	TArray<FAssetData> AssetDataArray{};
+	AssetDataArray.Add(*AssetManagerData.SelectedAsset.Get());
+
+	FDataAssetManagerAssetService::ProcessAssetData(AssetDataArray,
+		[](const TArray<FAssetIdentifier>& AssetIdentifiers) {
+			IAssetManagerEditorModule::Get().OpenSizeMapUI(AssetIdentifiers);
+		});
+}
+
+void SDataAssetManagerWidget::OpenPluginSettings()
+{
+	ISettingsModule& SettingsModule = FModuleManager::LoadModuleChecked<ISettingsModule>(DataAssetManager::ModuleName::Settings);
+	SettingsModule.ShowViewer("Project", "Plugins", "DataAssetManager");
+}
+
+void SDataAssetManagerWidget::ShowSourceControlDialog()
+{
+	ISourceControlModule::Get().ShowLoginDialog(FSourceControlLoginClosed(), ELoginWindowMode::Modeless);
+}
+
+void SDataAssetManagerWidget::RestartPlugin()
+{
+	FDataAssetManagerModule& DataManagerModule = FModuleManager::LoadModuleChecked<FDataAssetManagerModule>(DataAssetManager::ModuleName::DataAssetManager);
+	DataManagerModule.RestartWidget();
+}
+
+void SDataAssetManagerWidget::OpenMessageLogWindow()
+{
+	FMessageLogModule& MessageLogModule{ FModuleManager::LoadModuleChecked<FMessageLogModule>(DataAssetManager::ModuleName::MessageLog) };
+	MessageLogModule.OpenMessageLog("AssetCheck");
+}
+
+void SDataAssetManagerWidget::OpenOutputLogWindow()
+{
+	FOutputLogModule& OutputLogModule{ FModuleManager::LoadModuleChecked<FOutputLogModule>(DataAssetManager::ModuleName::OutputLog) };
+	OutputLogModule.OpenOutputLog();
+}
+
+bool SDataAssetManagerWidget::CanRename() const
+{
+	return EditableWidgets.bCanRename;
+}
+
+void SDataAssetManagerWidget::HandleAssetDoubleClick(const FGeometry& InGeometry, const FPointerEvent& MouseEvent)
+{
+	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+	{
+		OpenSelectedDataAssetInEditor();
+	}
+}
+
+FText SDataAssetManagerWidget::GetSelectedTextBlockInfo() const
+{
+	const FString SelectedStrItems{ GetAssetListSelectedItem().Num() > 0 ? FString::Printf(TEXT("(%d selected)"), GetAssetListSelectedItem().Num()) : TEXT("") };
+
+	return FText::FromString(FString::Printf(TEXT("   %d items %s"), AssetManagerData.FilteredDataAssets.Num(), *SelectedStrItems));
+}
+
+bool SDataAssetManagerWidget::IsDetailsViewEmpty() const
+{
+	return AssetManagerWidgets.DetailsView->GetSelectedObjects().Num() == 0;
+}
+
+void SDataAssetManagerWidget::RegisterEditableText(TSharedPtr<FAssetData> AssetData, TSharedRef<SEditableText> EditableText)
+{
+	EditableWidgets.AddEditableTextWidget(AssetData.Get(), EditableText);
+}
+
+void SDataAssetManagerWidget::HandleAssetRename(TSharedPtr<FAssetData> AssetData, const FText& InText, ETextCommit::Type CommitMethod)
+{
+	if (!AssetManagerData.SelectedAsset.IsValid() || InText.IsEmpty())
+	{
+		EditableWidgets.bRenamedProgress = false;
+		return;
+	}
+
+	if (IConsoleManager::Get().FindConsoleVariable(TEXT("ShowDebugDataAssetManager"))->GetBool())
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("%s EditableTextWidgets counts %d"), ANSI_TO_TCHAR(__FUNCTION__), EditableWidgets.EditableTextWidgets.Num());
+	}
+
+	if (CommitMethod == ETextCommit::OnEnter)
+	{
+		UObject* const Asset{ AssetManagerData.SelectedAsset->GetAsset() };
+		if (!IsValid(Asset))
+		{
+			UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("Asset is not valid"));
+			return;
+		}
+
+		const FString NewName = InText.ToString();
+		if (FDataAssetManagerAssetService::RenameAsset(AssetManagerData.SelectedAsset, NewName))
+		{
+			EditableWidgets.bRenamedProgress = false;
+			if (IConsoleManager::Get().FindConsoleVariable(TEXT("ShowDebugDataAssetManager"))->GetBool())
+			{
+				UE_LOG(SDataAssetManagerWidgetLog, Log, TEXT("Asset renamed %s"), *Asset->GetName());
+			}
+		}
+	}
+}
+
+ESelectionMode::Type SDataAssetManagerWidget::GetAssetListSelectionMode() const
+{
+	return EditableWidgets.bRenamedProgress ? ESelectionMode::Single : ESelectionMode::Multi;
+}
+
+EVisibility SDataAssetManagerWidget::GetVisibilitySearchBox() const
+{
+	return SplitterValue.Get() < DataAssetManager::SearchBoxHideThreshold ? EVisibility::Hidden : EVisibility::Visible;
+}
+
+void SDataAssetManagerWidget::SubscribeToAssetRegistryEvent()
+{
+	RegistrySubscription.Reset();
+	RegistrySubscription = MakeUnique<FDataAssetRegistrySubscription>(
+		[this](const FAssetData& Asset) { OnAssetAdded(Asset); },
+		[this](const FAssetData& Asset) { OnAssetRemoved(Asset); },
+		[this](const FAssetData& Asset, const FString& OldPath) { OnAssetRenamed(Asset, OldPath); });
+}
+
+void SDataAssetManagerWidget::InitializeTextFontInfo()
+{
+	TextFontInfo = FCoreStyle::Get().GetFontStyle(FName("NormalText"));
+	TextFontInfo.Size = DataAssetManager::DataAssetFontSize;
+}
+
+void SDataAssetManagerWidget::CreateDetailsView()
+{
+	const FDetailsViewArgs DetailsViewArgs = CreateDetailsViewArgs();
+
+	FPropertyEditorModule& PropertyModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>(DataAssetManager::ModuleName::PropertyEditor);
+	AssetManagerWidgets.DetailsView = PropertyModule.CreateDetailView(DetailsViewArgs);
+	AssetManagerWidgets.DetailsView->SetExtensionHandler(MakeShared<FDataAssetDetailsExtensionHandler>());
+}
+
+FDetailsViewArgs SDataAssetManagerWidget::CreateDetailsViewArgs() const
+{
+	FDetailsViewArgs Args{};
+	Args.bHideSelectionTip = true;
+	Args.bShowObjectLabel = false;
+	Args.bCustomNameAreaLocation = false;
+	Args.bAllowMultipleTopLevelObjects = true;
+	Args.bShowOptions = true;
+	Args.bShowPropertyMatrixButton = false;
+	Args.bShowDifferingPropertiesOption = true;
+	return Args;
+}
+
+TSharedPtr<SLayeredImage> SDataAssetManagerWidget::CreateFilterImage()
+{
+	return SNew(SLayeredImage)
+		.Image(FAppStyle::Get().GetBrush("Icons.Filter"))
+		.ColorAndOpacity(FSlateColor(FColor::White))
+		.Visibility_Lambda(
+			[this]() {
+				return SplitterValue.Get() < 0.05f ? EVisibility::Hidden : EVisibility::Visible;
+			});
+}
+
+void SDataAssetManagerWidget::CreateContextMenuFromDataAsset(const FGeometry& InGeometry, const FPointerEvent& MouseEvent)
+{
+	if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
+	{
+		FMenuBuilder MenuBuilder(true, nullptr);
+
+		MenuBuilder.BeginSection("AssetActions", LOCTEXT("AssetActionsSection", "Asset"));
+		MenuBuilder.AddMenuEntry(LOCTEXT("OpenInPropertyMatrixMenuEntry", "Open in Property Matrix"),
+			LOCTEXT("OpenInPropertyMatrixMenuTooltip", "Open the selected DataAsset(s) in the Property Matrix panel"),
+			FSlateIcon(FSlateIconFinder::FindIcon("PropertyEditor.Grid.TabIcon")),
+			FUIAction(FExecuteAction::CreateSP(this, &SDataAssetManagerWidget::OpenSelectionInPropertyMatrix),
+				FCanExecuteAction::CreateLambda([this]() { return CanOpenSelectedAssetsInPropertyEditor(); })));
+
+		MenuBuilder.AddMenuEntry(LOCTEXT("ReferenceInspectorMenuEntry", "Reference Inspector"),
+			LOCTEXT("ReferenceInspectorMenuTooltip", "Inspect assets referenced by this Data Asset and assets that reference it"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Search"),
+			FUIAction(FExecuteAction::CreateSP(this, &SDataAssetManagerWidget::OpenReferenceInspector),
+				FCanExecuteAction::CreateSP(this, &SDataAssetManagerWidget::HasSelectedAssets)));
+
+		MenuBuilder.AddMenuEntry(LOCTEXT("DataAssetDiffMenuEntry", "DataAsset Diff"),
+			LOCTEXT("DataAssetDiffMenuTooltip", "Compare editable properties for two selected Data Assets of the same class"),
+			FSlateIcon(FRevisionControlStyleManager::GetStyleSetName(), "RevisionControl.Actions.Diff"),
+			FUIAction(FExecuteAction::CreateSP(this, &SDataAssetManagerWidget::OpenDataAssetDiff),
+				FCanExecuteAction::CreateSP(this, &SDataAssetManagerWidget::CanOpenDataAssetDiff)));
+
+		MenuBuilder.AddMenuEntry(LOCTEXT("RenameMenuEntry", "Rename         "),
+			LOCTEXT("RenameMenuTooltip", "Rename this item"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Rename"),
+			FUIAction(FExecuteAction::CreateSP(this, &SDataAssetManagerWidget::FocusOnSelectedAsset),
+				FCanExecuteAction::CreateLambda([this]() { return CanRename(); })));
+
+		MenuBuilder.AddMenuEntry(LOCTEXT("DeleteMenuEntry", "Delete         "),
+			LOCTEXT("DeleteMenuTooltip", "Delete this item"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Delete"),
+			FUIAction(FExecuteAction::CreateSP(this, &SDataAssetManagerWidget::DeleteDataAsset)));
+		MenuBuilder.EndSection();
+
+		MenuBuilder.BeginSection("BulkOperations", LOCTEXT("BulkOperationsSection", "Bulk Operations"));
+		MenuBuilder.AddMenuEntry(LOCTEXT("BulkSaveSelectedMenuEntry", "Save Selected"),
+			LOCTEXT("BulkSaveSelectedMenuTooltip", "Save all selected Data Assets"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Save"),
+			FUIAction(FExecuteAction::CreateSP(this, &SDataAssetManagerWidget::SaveDataAsset),
+				FCanExecuteAction::CreateSP(this, &SDataAssetManagerWidget::HasSelectedAssets)));
+
+		MenuBuilder.AddMenuEntry(LOCTEXT("BulkDuplicateSelectedMenuEntry", "Duplicate Selected"),
+			LOCTEXT("BulkDuplicateSelectedMenuTooltip", "Duplicate all selected Data Assets next to the original assets"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Duplicate"),
+			FUIAction(FExecuteAction::CreateSP(this, &SDataAssetManagerWidget::DuplicateSelectedDataAssets),
+				FCanExecuteAction::CreateSP(this, &SDataAssetManagerWidget::HasSelectedAssets)));
+
+		MenuBuilder.AddMenuEntry(LOCTEXT("BulkMoveSelectedMenuEntry", "Move Selected..."),
+			LOCTEXT("BulkMoveSelectedMenuTooltip", "Move all selected Data Assets to another content folder"),
+			FSlateIcon(FSlateIconFinder::FindIcon("ContentBrowser.AddContent")),
+			FUIAction(FExecuteAction::CreateSP(this, &SDataAssetManagerWidget::MoveSelectedDataAssets),
+				FCanExecuteAction::CreateSP(this, &SDataAssetManagerWidget::HasSelectedAssets)));
+
+		MenuBuilder.AddMenuEntry(LOCTEXT("BulkValidateSelectedMenuEntry", "Validate Selected"),
+			LOCTEXT("BulkValidateSelectedMenuTooltip", "Validate all selected Data Assets and show results in Message Log"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Adjust"),
+			FUIAction(FExecuteAction::CreateSP(this, &SDataAssetManagerWidget::ValidateSelectedDataAssets),
+				FCanExecuteAction::CreateSP(this, &SDataAssetManagerWidget::HasSelectedAssets)));
+
+		MenuBuilder.AddMenuEntry(LOCTEXT("BulkValidateAllMenuEntry", "Validate All"),
+			LOCTEXT("BulkValidateAllMenuTooltip", "Validate all loaded Data Assets and show results in Message Log"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Adjust"),
+			FUIAction(FExecuteAction::CreateSP(this, &SDataAssetManagerWidget::ValidateAllDataAssets)));
+		MenuBuilder.EndSection();
+
+		FSlateApplication::Get().PushMenu(AsShared(),
+			FWidgetPath(),
+			MenuBuilder.MakeWidget(),
+			MouseEvent.GetScreenSpacePosition(),
+			FPopupTransitionEffect(FPopupTransitionEffect::ContextMenu));
+	}
+}
+
+TSharedRef<SWidget> SDataAssetManagerWidget::CreateComboButtonContent()
+{
+	FMenuBuilder MenuBuilder(/*bInShouldCloseWindowAfterMenuSelection*/ false, nullptr);
+
+	MenuBuilder.BeginSection("ResetSection", FText::FromString("Actions"));
+	{
+		MenuBuilder.AddMenuEntry(FText::FromString("Reset Filters"),
+			FText::FromString("Clear all selected type and plugin filters."),
+			FSlateIcon(),
+			FUIAction(FExecuteAction::CreateLambda(
+				[this]() {
+					AssetManagerData.ActiveFilters.Empty();
+					AssetManagerData.ActivePluginFilters.Empty();
+					AssetManagerData.InvalidAssetPackages.Empty();
+					AssetManagerData.bShowModifiedOnly = false;
+					AssetManagerData.bShowInvalidOnly = false;
+					UpdateFilteredAssetList();
+				})));
+	}
+	MenuBuilder.EndSection();
+
+	MenuBuilder.BeginSection("QuickFilters", FText::FromString("Quick Filters"));
+	{
+		MenuBuilder.AddMenuEntry(LOCTEXT("ShowModifiedOnlyFilter", "Modified Only"),
+			LOCTEXT("ShowModifiedOnlyFilterTooltip", "Show only Data Assets with dirty packages"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Save"),
+			FUIAction(FExecuteAction::CreateLambda(
+						  [this]() {
+							  AssetManagerData.bShowModifiedOnly = !AssetManagerData.bShowModifiedOnly;
+							  UpdateFilteredAssetList();
+						  }),
+				FCanExecuteAction(),
+				FIsActionChecked::CreateLambda(
+					[this]() {
+						return AssetManagerData.bShowModifiedOnly;
+					})),
+			NAME_None,
+			EUserInterfaceActionType::ToggleButton);
+
+		MenuBuilder.AddMenuEntry(LOCTEXT("ShowInvalidOnlyFilter", "Invalid Only"),
+			LOCTEXT("ShowInvalidOnlyFilterTooltip", "Show only Data Assets that failed the latest validation pass"),
+			FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.Adjust"),
+			FUIAction(FExecuteAction::CreateLambda(
+						  [this]() {
+							  AssetManagerData.bShowInvalidOnly = !AssetManagerData.bShowInvalidOnly;
+							  UpdateFilteredAssetList();
+						  }),
+				FCanExecuteAction::CreateLambda(
+					[this]() {
+						return AssetManagerData.InvalidAssetPackages.Num() > 0;
+					}),
+				FIsActionChecked::CreateLambda(
+					[this]() {
+						return AssetManagerData.bShowInvalidOnly;
+					})),
+			NAME_None,
+			EUserInterfaceActionType::ToggleButton);
+	}
+	MenuBuilder.EndSection();
+
+	MenuBuilder.AddWidget(
+		SNew(SBox)
+			.Padding(FMargin(5.f, 7.f))
+				[SNew(SSeparator)],
+		FText::GetEmpty());
+
+	MenuBuilder.BeginSection("TypeFilters", FText::FromString("Asset Types"));
+	for (const TSharedPtr<FString>& FilterItem : ComboBoxAssetListItems)
+	{
+		AddToggleFilterMenuEntry(MenuBuilder, *FilterItem, AssetManagerData.ActiveFilters,
+			[this] {
+				UpdateFilteredAssetList();
+			});
+	}
+	MenuBuilder.EndSection();
+
+	MenuBuilder.AddWidget(
+		SNew(SBox)
+			.Padding(FMargin(5.f, 7.f))
+				[SNew(SSeparator)],
+		FText::GetEmpty());
+
+	MenuBuilder.BeginSection("PluginFilters", FText::FromString("Plugins"));
+
+	for (const TSharedPtr<FString>& PluginItem : PluginFilterListItems)
+	{
+		AddToggleFilterMenuEntry(MenuBuilder,
+			*PluginItem,
+			AssetManagerData.ActivePluginFilters,
+			[this] {
+				UpdateFilteredAssetList();
+			});
+	}
+	MenuBuilder.EndSection();
+
+	return MenuBuilder.MakeWidget();
+}
+
+void SDataAssetManagerWidget::AddToggleFilterMenuEntry(FMenuBuilder& MenuBuilder, const FString& FilterName, TSet<FString>& ActiveFilters, TFunction<void()> UpdateFunc)
+{
+	FUIAction Action(FExecuteAction::CreateLambda(
+						 [&ActiveFilters, FilterName, UpdateFunc]() {
+							 if (ActiveFilters.Contains(FilterName))
+							 {
+								 ActiveFilters.Remove(FilterName);
+							 }
+							 else
+							 {
+								 ActiveFilters.Add(FilterName);
+							 }
+							 UpdateFunc();
+						 }),
+		FCanExecuteAction(),
+		FIsActionChecked::CreateLambda(
+			[&ActiveFilters, FilterName]() {
+				return ActiveFilters.Contains(FilterName);
+			}));
+
+	MenuBuilder.AddMenuEntry(FText::FromString(FilterName), FText::GetEmpty(), FSlateIcon(), Action, NAME_None, EUserInterfaceActionType::ToggleButton);
+}
+
+FReply SDataAssetManagerWidget::OnItemClicked(TSharedPtr<FString> SourceItem)
+{
+	SelectedAssetType = SourceItem;
+	UpdateFilteredAssetList();
+	if (AssetManagerWidgets.IsValidComboButton())
+	{
+		AssetManagerWidgets.ComboButton->SetIsOpen(false);
+	}
+
+	return FReply::Handled();
+}
+
+void SDataAssetManagerWidget::LoadDataAssets(const UDataAssetManagerSettings* PluginSettings)
+{
+	FDataAssetManagerAssetService::LoadDataAssets(PluginSettings, AssetManagerData.DataAssets, PluginFilterListItems);
+}
+
+void SDataAssetManagerWidget::UpdateFilteredAssetList(const TMap<FString, FString>& RenamedPaths)
+{
+	const TArray<TSharedPtr<FAssetData>> PreviousSelection = GetAssetListSelectedItem();
+	const FString SearchString = SearchText.Get().ToString();
+	FDataAssetListModel::ApplyFilters(AssetManagerData.DataAssets,
+		SearchString,
+		AssetManagerData.ActiveFilters,
+		AssetManagerData.ActivePluginFilters,
+		AssetManagerData.InvalidAssetPackages,
+		AssetManagerData.bShowModifiedOnly,
+		AssetManagerData.bShowInvalidOnly,
+		AssetManagerData.FilteredDataAssets);
+
+	if (AssetManagerWidgets.IsValidAssetListView())
+	{
+		const TArray<TSharedPtr<FAssetData>> Restored = FDataAssetListModel::RestoreSelection(PreviousSelection, AssetManagerData.FilteredDataAssets, RenamedPaths);
+		{
+			TGuardValue<bool> Restoring(bRestoringSelection, true);
+			AssetManagerWidgets.AssetListView->ClearSelection();
+			for (const TSharedPtr<FAssetData>& Item : Restored)
+			{
+				AssetManagerWidgets.AssetListView->SetItemSelection(Item, true, ESelectInfo::Direct);
+			}
+		}
+		OnAssetSelected(Restored.IsEmpty() ? nullptr : Restored[0], ESelectInfo::Direct);
+		AssetManagerWidgets.AssetListView->RequestListRefresh();
+	}
+}
+
+void SDataAssetManagerWidget::OnSearchTextChanged(const FText& InText)
+{
+	SearchText.Set(InText);
+	UpdateFilteredAssetList();
+}
+
+TSharedRef<ITableRow> SDataAssetManagerWidget::GenerateAssetListRow(TSharedPtr<FAssetData> Item, const TSharedRef<STableViewBase>& OwnerSTable)
+{
+	return SNew(SDataAssetTableRow, OwnerSTable)
+		.Item(Item)
+		.OnAssetRenamed(SharedThis(this), &SDataAssetManagerWidget::HandleAssetRename)
+		.OnCreateContextMenu(SharedThis(this), &SDataAssetManagerWidget::CreateContextMenuFromDataAsset)
+		.OnAssetDoubleClicked(SharedThis(this), &SDataAssetManagerWidget::HandleAssetDoubleClick)
+		.OnRegisterEditableText(SharedThis(this), &SDataAssetManagerWidget::RegisterEditableText)
+		.OnGetValidationState(SharedThis(this), &SDataAssetManagerWidget::GetValidationStateForAsset)
+		.OnMouseButtonDown(SharedThis(this), &SDataAssetManagerWidget::HandleRowMouseButtonDown);
+}
+
+FReply SDataAssetManagerWidget::HandleRowMouseButtonDown(const FGeometry& InGeometry, const FPointerEvent& MouseEvent)
+{
+	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+	{
+		return FReply::Unhandled();
+	}
+	return FReply::Handled();
+}
+
+void SDataAssetManagerWidget::InitializeAssetTypeComboBox(const TArray<TSharedPtr<FAssetData>>& AssetDataList)
+{
+	ComboBoxAssetListItems = FDataAssetListModel::BuildAssetTypeItems(AssetDataList);
+}
+
+void SDataAssetManagerWidget::FocusOnNewlyAddedAsset(const FAssetData& NewAssetData)
+{
+	TSharedPtr<FAssetData> NewAssetPtr = nullptr;
+	for (const TSharedPtr<FAssetData>& Asset : AssetManagerData.FilteredDataAssets)
+	{
+		if (Asset->PackageName == NewAssetData.PackageName)
+		{
+			NewAssetPtr = Asset;
+			break;
+		}
+	}
+
+	if (!NewAssetPtr.IsValid())
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("%s Newly added asset '%s' not found in filtered list"), ANSI_TO_TCHAR(__FUNCTION__), *NewAssetData.PackageName.ToString());
+		return;
+	}
+
+	if (const UObject* AssetObject = NewAssetPtr->GetAsset())
+	{
+		if (AssetObject->HasAnyFlags(RF_NeedLoad | RF_NeedPostLoad))
+		{
+			/** Retrieve resources that have not yet been loaded */
+			/** Accessing such objects may result in crashes or UB.*/
+			UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("%s: Asset '%s' is not fully loaded (flags: %X)"), ANSI_TO_TCHAR(__FUNCTION__), *AssetObject->GetName(), AssetObject->GetFlags());
+			return;
+		}
+	}
+	else
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("%s: Failed to load asset '%s'"), ANSI_TO_TCHAR(__FUNCTION__), *NewAssetData.PackageName.ToString());
+		return;
+	}
+
+	if (AssetManagerWidgets.AssetListView.IsValid())
+	{
+		AssetManagerWidgets.AssetListView->SetSelection(NewAssetPtr);
+		OnAssetSelected(NewAssetPtr, ESelectInfo::Direct);
+		AssetManagerWidgets.AssetListView->RequestScrollIntoView(NewAssetPtr);
+	}
+}
+
+FReply SDataAssetManagerWidget::ColumnButtonClicked(const FGeometry& InGeometry, const FPointerEvent& MouseEvent)
+{
+	if (MouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
+	{
+		FMenuBuilder MenuBuilder{ true, nullptr };
+
+		MenuBuilder.BeginSection("AdditionalActions", LOCTEXT("AdditionalActionsSection", "Additional Actions"));
+		{
+			MenuBuilder.AddMenuEntry(LOCTEXT("ToggleAllColumns", "Hide All Columns"),
+				LOCTEXT("ToggleAllColumnsTooltip", "Hide or show all columns at once"),
+				FSlateIcon(),
+				FUIAction(FExecuteAction::CreateLambda(
+							  [this]() {
+								  ColumnData.ToggleAllColumnsVisibility();
+								  UpdateColumnVisibility();
+							  }),
+					FCanExecuteAction(),
+					FIsActionChecked::CreateLambda(
+						[this]() {
+							/* Checked if all columns are hidden */
+							return ColumnData.AreAllColumnsHidden();
+						})),
+				NAME_None,
+				EUserInterfaceActionType::ToggleButton);
+		}
+		MenuBuilder.EndSection();
+
+		MenuBuilder.BeginSection("ColumnVisibility", LOCTEXT("ColumnVisibilitySection", "Visible Columns"));
+		{
+			AddColumnMenuEntry(MenuBuilder,
+				LOCTEXT("ShowType", "Show Type"),
+				LOCTEXT("ShowTypeTooltip", "Toggle the visibility of the Type column"),
+				&ColumnData.ColumnVisibility.bShowTypeColumn);
+			AddColumnMenuEntry(MenuBuilder,
+				LOCTEXT("ShowPath", "Show Path"),
+				LOCTEXT("ShowPathTooltip", "Toggle the visibility of the Path column"),
+				&ColumnData.ColumnVisibility.bShowPathColumn);
+			AddColumnMenuEntry(MenuBuilder,
+				LOCTEXT("ShowDiskSize", "Show Disk Size"),
+				LOCTEXT("ShowDiskSizeTooltip", "Toggle the visibility of the Disk Size column"),
+				&ColumnData.ColumnVisibility.bShowDiskSizeColumn);
+			AddColumnMenuEntry(MenuBuilder,
+				LOCTEXT("RevisionControl", "Revision Control"),
+				LOCTEXT("RevisionControlTooltip", "Toggle the visibility of the Revision control column"),
+				&ColumnData.ColumnVisibility.bShowRevisionColumn);
+			AddColumnMenuEntry(MenuBuilder,
+				LOCTEXT("ValidationColumn", "Validation"),
+				LOCTEXT("ValidationColumnTooltip", "Toggle the visibility of the Validation column"),
+				&ColumnData.ColumnVisibility.bShowValidationColumn);
+		}
+		MenuBuilder.EndSection();
+
+		FSlateApplication::Get().PushMenu(SharedThis(this),
+			FWidgetPath(),
+			MenuBuilder.MakeWidget(),
+			MouseEvent.GetScreenSpacePosition(),
+			FPopupTransitionEffect(FPopupTransitionEffect::ContextMenu));
+
+		return FReply::Handled();
+	}
+
+	return FReply::Unhandled();
+}
+
+void SDataAssetManagerWidget::AddColumnToHeader(TSharedPtr<SHeaderRow> InHeaderRow, const FName& ColumnId, const FString& Label, const float FillWidth)
+{
+	InHeaderRow->AddColumn(
+		SHeaderRow::FColumn::FArguments()
+			.ColumnId(ColumnId)
+			.DefaultLabel(FText::FromString(Label))
+			.FillWidth(FillWidth)
+			.HeaderContent()
+				[SNew(SBorder)
+						.BorderBackgroundColor(FSlateColor(FColor::Transparent))
+						.OnMouseButtonDown(this, &SDataAssetManagerWidget::ColumnButtonClicked)
+							[SNew(STextBlock).Text(FText::FromString(Label))]]);
+}
+
+const FSlateBrush* SDataAssetManagerWidget::GetRevisionControlColumnIconBadge() const
+{
+	if (ISourceControlModule::Get().IsEnabled())
+	{
+		return FRevisionControlStyleManager::Get().GetBrush("RevisionControl.Icon.ConnectedBadge");
+	}
+	else
+	{
+		return nullptr;
+	}
+}
+
+void SDataAssetManagerWidget::InitializeColumnAdders()
+{
+	ColumnData.InitializeColumnAdders(
+		[this](TSharedPtr<SHeaderRow> HeaderRow, FName ColumnId, const TCHAR* Label, float Width) {
+			AddColumnToHeader(HeaderRow, ColumnId, Label, Width);
+		},
+		[this] {
+			return CreateRevisionControlColumn();
+		});
+}
+
+void SDataAssetManagerWidget::ToggleColumn(bool* bColumnPtr)
+{
+	check(bColumnPtr);
+	*bColumnPtr = !(*bColumnPtr);
+	UpdateColumnVisibility();
+}
+
+void SDataAssetManagerWidget::AddColumnMenuEntry(FMenuBuilder& MenuBuilder, FText Label, FText Tooltip, bool* ColumnFlag)
+{
+	MenuBuilder.AddMenuEntry(Label,
+		Tooltip,
+		FSlateIcon(),
+		FUIAction(FExecuteAction::CreateSP(SharedThis(this), &SDataAssetManagerWidget::ToggleColumn, ColumnFlag),
+			FCanExecuteAction(),
+			FIsActionChecked::CreateSP(SharedThis(this), &SDataAssetManagerWidget::IsColumnVisible, ColumnFlag)),
+		NAME_None,
+		EUserInterfaceActionType::ToggleButton);
+}
+
+bool SDataAssetManagerWidget::IsColumnVisible(bool* bColumnPtr) const
+{
+	check(bColumnPtr);
+	return *bColumnPtr;
+}
+
+SHeaderRow::FColumn::FArguments SDataAssetManagerWidget::CreateRevisionControlColumn()
+{
+	TSharedRef<SLayeredImage> RevisionControlColumnIcon =
+		SNew(SLayeredImage)
+			.ColorAndOpacity(FSlateColor::UseForeground())
+			.Image(FRevisionControlStyleManager::Get().GetBrush("RevisionControl.Icon"));
+
+	RevisionControlColumnIcon->AddLayer(TAttribute<const FSlateBrush*>::CreateSP(this, &SDataAssetManagerWidget::GetRevisionControlColumnIconBadge));
+
+	return SHeaderRow::Column(DataAssetListColumns::ColumnID_RC)
+		.FixedWidth(StaticCast<TOptional<float>>(DataAssetManager::RCFixedWidth))
+		.HAlignHeader(HAlign_Center)
+		.VAlignHeader(VAlign_Center)
+		.HAlignCell(HAlign_Center)
+		.VAlignCell(VAlign_Center)
+		.DefaultLabel(LOCTEXT("Column_RC", "Revision Control"))
+			[RevisionControlColumnIcon];
+}
+
+TSharedRef<SHeaderRow> SDataAssetManagerWidget::GenerateHeaderRow()
+{
+	return ColumnData.BuildHeaderRow();
+}
+
+void SDataAssetManagerWidget::UpdateColumnVisibility()
+{
+	ColumnData.UpdateColumnVisibility(AssetManagerWidgets.AssetListView->GetHeaderRow());
+	AssetManagerWidgets.AssetListView->RequestListRefresh();
+}
+
+void SDataAssetManagerWidget::FocusOnSelectedAsset()
+{
+	if (!IsSelectedAssetValid())
+	{
+		return;
+	}
+
+	UE_LOG(SDataAssetManagerLog, Verbose, TEXT("%s EditableTextWidgets counts %d"), ANSI_TO_TCHAR(__FUNCTION__), EditableWidgets.EditableTextWidgets.Num());
+
+	TSharedPtr<FAssetData> FoundAsset = nullptr;
+	for (const TSharedPtr<FAssetData>& DataAsset : AssetManagerData.FilteredDataAssets)
+	{
+		if (!DataAsset.IsValid() || !DataAsset->PackageName.IsEqual(AssetManagerData.SelectedAsset->PackageName))
+		{
+			continue;
+		}
+
+		FoundAsset = DataAsset;
+		break;
+	}
+
+	if (!FoundAsset.IsValid())
+	{
+		return;
+	}
+
+	const TPair<FName, FName> WidgetKey{ FoundAsset->PackagePath, FoundAsset->AssetName };
+
+	if (TSharedPtr<SEditableText>* FoundWidget = EditableWidgets.EditableTextWidgets.Find(WidgetKey))
+	{
+		if (FoundWidget->IsValid())
+		{
+			EditableWidgets.bRenamedProgress = true;
+			(*FoundWidget)->SetIsReadOnly(false);
+
+			FSlateApplication::Get().SetKeyboardFocus(*FoundWidget, EFocusCause::SetDirectly);
+			AssetManagerWidgets.EditableTextWidget = *FoundWidget;
+		}
+	}
+	else
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("Widget not found in EditableTextMap"));
+	}
+}
+
+void SDataAssetManagerWidget::OnAssetSelected(TSharedPtr<FAssetData> SelectedItem, ESelectInfo::Type SelectInfo)
+{
+	if (bRestoringSelection)
+	{
+		return;
+	}
+	const TArray<TSharedPtr<FAssetData>> SelectedItems = GetAssetListSelectedItem();
+	if (!SelectedItems.Contains(SelectedItem))
+	{
+		SelectedItem = SelectedItems.IsEmpty() ? nullptr : SelectedItems[0];
+	}
+	AssetManagerData.SelectedAsset = SelectedItem;
+	EditableWidgets.bCanRename = SelectedItems.Num() == 1;
+	if (!SelectedItem.IsValid())
+	{
+		EditableWidgets.bRenamedProgress = false;
+		AssetManagerWidgets.EditableTextWidget.Reset();
+		if (AssetManagerWidgets.IsValidDetailsView())
+		{
+			AssetManagerWidgets.DetailsView->SetObject(nullptr);
+		}
+		return;
+	}
+	OpenDetailViewPanelForAsset(SelectedItem);
+}
+
+void SDataAssetManagerWidget::OpenDetailViewPanelForAsset(TSharedPtr<FAssetData> SelectedItem)
+{
+	if (!SelectedItem.IsValid())
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("Selected Item is not valid"));
+		return;
+	}
+
+	UDataAsset* DataAsset = Cast<UDataAsset>(SelectedItem->GetAsset());
+	if (!IsValid(DataAsset))
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Error, TEXT("Failed to cast SelectedItem to UDataAsset. The asset might be of a different type or invalid."));
+		return;
+	}
+	const TArray<TSharedPtr<FAssetData>> SelectedAssets = GetAssetListSelectedItem();
+	if (SelectedAssets.Num() == 1)
+	{
+		AssetManagerWidgets.DetailsView->SetObject(DataAsset);
+	}
+	else
+	{
+		TArray<TWeakObjectPtr<UObject>> ObjectsToView{};
+		for (const TSharedPtr<FAssetData>& AssetData : SelectedAssets)
+		{
+			if (AssetData.IsValid())
+			{
+				if (UDataAsset* Asset = Cast<UDataAsset>(AssetData->GetAsset()))
+				{
+					ObjectsToView.Add(Asset);
+				}
+			}
+		}
+
+		AssetManagerWidgets.DetailsView->SetObjects(ObjectsToView, true, true);
+	}
+}
+
+void SDataAssetManagerWidget::RefreshAssetList(const TMap<FString, FString>& RenamedPaths)
+{
+	LoadDataAssets(DataAssetManager::GetPluginSettings());
+	UpdateFilteredAssetList(RenamedPaths);
+	InitializeAssetTypeComboBox(AssetManagerData.DataAssets);
+}
+
+void SDataAssetManagerWidget::OnAssetAdded(const FAssetData& NewAssetData)
+{
+	const bool bHadSelection = !GetAssetListSelectedItem().IsEmpty();
+	RefreshAssetList();
+	if (!bHadSelection)
+	{
+		FocusOnNewlyAddedAsset(NewAssetData);
+	}
+	if (IConsoleManager::Get().FindConsoleVariable(TEXT("ShowDebugDataAssetManager"))->GetBool())
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("%s Call Delegate"), ANSI_TO_TCHAR(__FUNCTION__));
+	}
+}
+
+void SDataAssetManagerWidget::OnAssetRemoved(const FAssetData& AssetToRemoved)
+{
+	RefreshAssetList();
+	if (IConsoleManager::Get().FindConsoleVariable(TEXT("ShowDebugDataAssetManager"))->GetBool())
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("%s Call Delegate"), ANSI_TO_TCHAR(__FUNCTION__));
+	}
+}
+
+void SDataAssetManagerWidget::OnAssetRenamed(const FAssetData& NewAssetData, const FString& Name)
+{
+	RefreshAssetList({ { Name, NewAssetData.GetSoftObjectPath().ToString() } });
+
+	if (IConsoleManager::Get().FindConsoleVariable(TEXT("ShowDebugDataAssetManager"))->GetBool())
+	{
+		UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("%s Call Delegate"), ANSI_TO_TCHAR(__FUNCTION__));
+	}
+}
+
+void SDataAssetManagerWidget::DeleteDataAsset()
+{
+	EditableWidgets.bCanRename = false;
+	FDataAssetManagerAssetService::DeleteAssets(GetAssetListSelectedItem(), /* bShowConfirmation = */ true);
+}
+
+void SDataAssetManagerWidget::DuplicateSelectedDataAssets()
+{
+	const TArray<TSharedPtr<FAssetData>> SelectedAssets = GetAssetListSelectedItem();
+	if (SelectedAssets.Num() == 0)
+	{
+		return;
+	}
+
+	TArray<FAssetData> DuplicatedAssets;
+	const int32 DuplicatedCount = FDataAssetManagerAssetService::DuplicateAssets(SelectedAssets, &DuplicatedAssets);
+	if (DuplicatedCount <= 0)
+	{
+		return;
+	}
+
+	RefreshAssetList();
+	if (DuplicatedAssets.Num() > 0)
+	{
+		FocusOnNewlyAddedAsset(DuplicatedAssets[0]);
+	}
+}
+
+void SDataAssetManagerWidget::MoveSelectedDataAssets()
+{
+	const TArray<TSharedPtr<FAssetData>> SelectedAssets = GetAssetListSelectedItem();
+	if (SelectedAssets.IsEmpty())
+	{
+		return;
+	}
+
+	const TWeakPtr<SDataAssetManagerWidget> WeakManager = SharedThis(this);
+	FDataAssetMoveWindow::Show(SelectedAssets,
+		[WeakManager](const TArray<FAssetData>& MovedAssets)
+		{
+			if (const TSharedPtr<SDataAssetManagerWidget> Manager = WeakManager.Pin())
+			{
+				Manager->RefreshAssetList();
+				if (!MovedAssets.IsEmpty())
+				{
+					Manager->FocusOnNewlyAddedAsset(MovedAssets[0]);
+				}
+			}
+		});
+}
+
+void SDataAssetManagerWidget::ValidateSelectedDataAssets()
+{
+	const TArray<TSharedPtr<FAssetData>> SelectedAssets = GetAssetListSelectedItem();
+	if (SelectedAssets.Num() == 0)
+	{
+		return;
+	}
+
+	ApplyValidationResults(FDataAssetManagerAssetService::ValidateAssets(SelectedAssets, true));
+}
+
+void SDataAssetManagerWidget::ValidateAllDataAssets()
+{
+	ApplyValidationResults(FDataAssetManagerAssetService::ValidateAssets(AssetManagerData.DataAssets, true));
+}
+
+void SDataAssetManagerWidget::ApplyValidationResults(FDataAssetValidationResults&& ValidationResults)
+{
+	for (const TPair<FName, FDataAssetValidationState>& ValidationState : ValidationResults.StatesByPackage)
+	{
+		AssetManagerData.ValidationStates.Add(ValidationState.Key, ValidationState.Value);
+	}
+
+	AssetManagerData.InvalidAssetPackages = MoveTemp(ValidationResults.InvalidPackages);
+	AssetManagerData.bShowInvalidOnly = AssetManagerData.InvalidAssetPackages.Num() > 0;
+	UpdateFilteredAssetList();
+	UpdateComboButtonContent();
+}
+
+const FDataAssetValidationState* SDataAssetManagerWidget::GetValidationStateForAsset(TSharedPtr<FAssetData> AssetData) const
+{
+	return AssetData.IsValid()
+		? AssetManagerData.ValidationStates.Find(AssetData->PackageName)
+		: nullptr;
+}
+
+bool SDataAssetManagerWidget::HasSelectedAssets() const
+{
+	return GetAssetListSelectedItem().Num() > 0;
+}
+
+// TODO!!! Original code copied from the FAssetFileContextMenu class
+// AssetFileContextMenu::ExecuteShowAssetMetaData()
+// (*minor refactoring of the original code *const fix added)
+void SDataAssetManagerWidget::ShowAssetMetaData()
+{
+	for (const TSharedPtr<FAssetData>& AssetData : GetAssetListSelectedItem())
+	{
+		const UObject* Asset = AssetData.Get()->GetAsset();
+		if (IsValid(Asset))
+		{
+			const TMap<FName, FString>* TagValues = UMetaData::GetMapForObject(Asset);
+			if (TagValues)
+			{
+				const FString Title = FString::Printf(TEXT("Metadata: %s"), *AssetData.Get()->AssetName.ToString());
+
+				TSharedPtr<SWindow> Window =
+					SNew(SWindow)
+						.Title(FText::FromString(Title))
+						.SupportsMaximize(false)
+						.SupportsMinimize(false)
+						.MinWidth(DataAssetManager::MetaDataWindowWidth)
+						.MinHeight(DataAssetManager::MetaDataWindowHeight)
+							[SNew(SBorder)
+									.Padding(4.f)
+									.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+										[SNew(SMetaDataView, *TagValues)]];
+
+				FSlateApplication::Get().AddWindow(Window.ToSharedRef());
+			}
+			else
+			{
+				FNotificationInfo Info(FText::Format(LOCTEXT("NoMetaDataFound", "No metadata found for asset {0}."), FText::FromString(Asset->GetName())));
+				Info.ExpireDuration = DataAssetManager::ExpireDuration;
+				FSlateNotificationManager::Get().AddNotification(Info);
+			}
+		}
+	}
+}
+
+void SDataAssetManagerWidget::OpenSelectionInPropertyMatrix()
+{
+	const TArray<TSharedPtr<FAssetData>> SelectedItems = GetAssetListSelectedItem();
+	TArray<UObject*> SelectedObjects;
+	for (const TSharedPtr<FAssetData>& AssetDataPtr : SelectedItems)
+	{
+		if (AssetDataPtr.IsValid())
+		{
+			UObject* Asset = AssetDataPtr->GetAsset();
+			if (Asset)
+			{
+				SelectedObjects.Add(Asset);
+			}
+		}
+	}
+
+	if (SelectedObjects.Num() > 0)
+	{
+		FPropertyEditorModule& PropertyEditorModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>(DataAssetManager::ModuleName::PropertyEditor);
+		PropertyEditorModule.CreatePropertyEditorToolkit(TSharedPtr<IToolkitHost>(), SelectedObjects);
+	}
+}
+
+bool SDataAssetManagerWidget::CanOpenSelectedAssetsInPropertyEditor() const
+{
+	const FPropertyEditorModule& PropertyEditorModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>(DataAssetManager::ModuleName::PropertyEditor);
+	if (!PropertyEditorModule.GetCanUsePropertyMatrix())
+	{
+		return false;
+	}
+
+	TArray<TSharedPtr<FAssetData>> SelectedItems = GetAssetListSelectedItem();
+	return SelectedItems.Num() > 0;
+}
+
+bool SDataAssetManagerWidget::SaveAllDataAsset()
+{
+	return FDataAssetManagerAssetService::SaveAllDataAssets(AssetManagerData.DataAssets);
+}
+
+void SDataAssetManagerWidget::UpdateComboButtonContent()
+{
+	if (AssetManagerWidgets.IsValidComboButton())
+	{
+		AssetManagerWidgets.ComboButton->SetMenuContent(CreateComboButtonContent());
+	}
+}
+
+TArray<TSharedPtr<FAssetData>> SDataAssetManagerWidget::GetAssetListSelectedItem() const
+{
+	TArray<TSharedPtr<FAssetData>> SelectedItems{};
+	if (AssetManagerWidgets.IsValidAssetListView())
+	{
+		AssetManagerWidgets.AssetListView->GetSelectedItems(SelectedItems);
+	}
+
+	return SelectedItems;
+}
+
+bool SDataAssetManagerWidget::IsSelectedAssetValid(const FString& CustomMessage) const
+{
+	if (AssetManagerData.IsValidSelectedAsset())
+	{
+		return true;
+	}
+
+	const FString ErrorMsg = CustomMessage.IsEmpty() ? FString::Printf(TEXT("%hs Selected Asset is not valid"), __FUNCTION__) : CustomMessage;
+
+	UE_LOG(SDataAssetManagerWidgetLog, Warning, TEXT("%s"), *ErrorMsg);
+	return false;
+}
+
+#undef LOCTEXT_NAMESPACE
