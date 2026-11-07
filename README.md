@@ -4,6 +4,8 @@ An Unreal Editor plugin for browsing, editing and managing Data Asset instances 
 
 **Compatibility:** Unreal Engine 5.5 on Windows. See the repository branches for other engine versions as they become available.
 
+![Data Asset Manager in Unreal Editor](Resources/DataAssetManagerImage.jpg)
+
 ## Features
 
 - Browse Data Assets from configured project directories and enabled project plugin content roots.
