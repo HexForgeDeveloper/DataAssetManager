@@ -98,14 +98,14 @@ TSharedRef<SWindow> FDataAssetDiffWindow::Create(TSharedRef<FDataAssetDiffResult
 						.ColorAndOpacity(FSlateColor::UseSubduedForeground())
 					]
 				]
-
+						
 				+ SHorizontalBox::Slot()
 				.AutoWidth()
 				.VAlign(VAlign_Center)
 				.Padding(10.0f, 0.0f)
 				[
 					SNew(STextBlock)
-					.Text_Lambda([DiffResult]()
+					.Text_Lambda([DiffResult]() 
 						{
 							return FText::Format(LOCTEXT("DataAssetDiffCount", "{0} difference(s)"), FText::AsNumber(DiffResult->Entries.Num()));
 						})
@@ -123,7 +123,7 @@ TSharedRef<SWindow> FDataAssetDiffWindow::Create(TSharedRef<FDataAssetDiffResult
 						.Text(RightName)
 						.Font(FAppStyle::GetFontStyle("DetailsView.CategoryFontStyle"))
 					]
-
+				
 					+ SVerticalBox::Slot()
 					.AutoHeight()
 					.Padding(8.0f, 2.0f, 0.0f, 0.0f)
@@ -180,7 +180,7 @@ TSharedRef<SWindow> FDataAssetDiffWindow::Create(TSharedRef<FDataAssetDiffResult
 		+ SVerticalBox::Slot()
 		.FillHeight(1.0f)
 		.Padding(8.0f, 0.0f, 8.0f, 8.0f)
-		[
+		[	
 			SNew(SOverlay)
 			+ SOverlay::Slot()
 			[
@@ -194,7 +194,7 @@ TSharedRef<SWindow> FDataAssetDiffWindow::Create(TSharedRef<FDataAssetDiffResult
 				SNew(STextBlock)
 				.Text(LOCTEXT("DataAssetDiffNoDifferences", "No editable property differences found"))
 				.ColorAndOpacity(FSlateColor::UseSubduedForeground())
-				.Visibility_Lambda([DiffResult]()
+				.Visibility_Lambda([DiffResult]() 
 					{
 						return DiffResult->HasDifferences()
 							? EVisibility::Collapsed
@@ -295,7 +295,7 @@ TSharedRef<ITableRow> FDataAssetDiffWindow::GenerateDataAssetDiffRow(TSharedPtr<
 						.ButtonStyle(FAppStyle::Get(), "SimpleButton")
 						.ContentPadding(FMargin(6.0f, 2.0f))
 						.ToolTipText(LOCTEXT("DataAssetDiffCopyLeftToRightTooltip", "Copy the left value to the right Data Asset"))
-						.OnClicked_Lambda([Entry, DiffResult, RefreshDiff]()
+						.OnClicked_Lambda([Entry, DiffResult, RefreshDiff]() 
 							{
 								CopyDataAssetDiffValue(Entry, DiffResult, true, RefreshDiff);
 								return FReply::Handled();
@@ -305,7 +305,7 @@ TSharedRef<ITableRow> FDataAssetDiffWindow::GenerateDataAssetDiffRow(TSharedPtr<
 							.Text(LOCTEXT("DataAssetDiffCopyLeftToRight", "L -> R"))
 						]
 					]
-
+					
 					+ SVerticalBox::Slot()
 					.AutoHeight()
 					.Padding(0.0f, 2.0f, 0.0f, 0.0f)
@@ -314,7 +314,7 @@ TSharedRef<ITableRow> FDataAssetDiffWindow::GenerateDataAssetDiffRow(TSharedPtr<
 						.ButtonStyle(FAppStyle::Get(), "SimpleButton")
 						.ContentPadding(FMargin(6.0f, 2.0f))
 						.ToolTipText(LOCTEXT("DataAssetDiffCopyRightToLeftTooltip", "Copy the right value to the left Data Asset"))
-						.OnClicked_Lambda([Entry, DiffResult, RefreshDiff]()
+						.OnClicked_Lambda([Entry, DiffResult, RefreshDiff]() 
 							{
 								CopyDataAssetDiffValue(Entry, DiffResult, false, RefreshDiff);
 								return FReply::Handled();

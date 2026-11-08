@@ -25,7 +25,7 @@ TSharedRef<SWidget> SFolderItemTree::GenerateWidgetForColumn(const FName& InColu
         }
 
         TSharedRef<SHorizontalBox> HorizontalBox = SNew(SHorizontalBox).ToolTipText(FText::FromString(Item->FolderPath))
-
+                
                 + SHorizontalBox::Slot()
                 .AutoWidth()
                 .Padding(FMargin{ 2.0f })
@@ -34,7 +34,7 @@ TSharedRef<SWidget> SFolderItemTree::GenerateWidgetForColumn(const FName& InColu
                         .IndentAmount(10)
                         .ShouldDrawWires(false)
                 ]
-
+                
                 + SHorizontalBox::Slot()
                 .AutoWidth()
                 .Padding(0, 0, 2, 0)
@@ -54,7 +54,7 @@ TSharedRef<SWidget> SFolderItemTree::GenerateWidgetForColumn(const FName& InColu
                 ];
 
         return HorizontalBox;
-
+                
 }
 
 /* clang-format on */

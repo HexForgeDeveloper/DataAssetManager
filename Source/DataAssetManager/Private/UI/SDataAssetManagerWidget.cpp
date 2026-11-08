@@ -123,7 +123,7 @@ void SDataAssetManagerWidget::Construct(const FArguments& InArgs)
 				.HAlign(HAlign_Right)
 				.AutoWidth()
 				.Padding(4.0f, 0.0f, 0.0f, 0.0f)
-				[
+				[	
 					SAssignNew(AssetManagerWidgets.ComboButton, SComboButton)
 					.ComboButtonStyle(&FAppStyle::Get().GetWidgetStyle<FComboButtonStyle>("SimpleComboButtonWithIcon"))
 					.ForegroundColor(FSlateColor::UseStyle())
@@ -156,9 +156,9 @@ void SDataAssetManagerWidget::Construct(const FArguments& InArgs)
 				.AutoWidth()
 				[
 					SNew(STextBlock)
-					.Text_Lambda([this]()
-						{
-							return GetSelectedTextBlockInfo();
+					.Text_Lambda([this]() 
+						{ 
+							return GetSelectedTextBlockInfo(); 
 						})
 				]
 			]
@@ -177,7 +177,7 @@ void SDataAssetManagerWidget::Construct(const FArguments& InArgs)
 					SNew(SBorder)
 					.BorderImage(FAppStyle::GetBrush("DetailsView.CategoryTop"))
 					.Padding(FMargin(8.0f, 4.0f))
-					.Visibility_Lambda([this]()
+					.Visibility_Lambda([this]() 
 						{
 							return GetAssetListSelectedItem().Num() > 1 ? EVisibility::Visible : EVisibility::Collapsed;
 						})
@@ -188,7 +188,7 @@ void SDataAssetManagerWidget::Construct(const FArguments& InArgs)
 						.VAlign(VAlign_Center)
 						[
 							SNew(STextBlock)
-							.Text_Lambda([this]()
+							.Text_Lambda([this]() 
 								{
 									return FText::Format(
 									LOCTEXT("BulkEditSelectionLabel", "Bulk Edit: {0} assets"),
@@ -205,7 +205,7 @@ void SDataAssetManagerWidget::Construct(const FArguments& InArgs)
 							.ContentPadding(FMargin(4.0f, 2.0f))
 							.ToolTipText(LOCTEXT("OpenPropertyMatrixTooltip", "Open selected Data Assets in Property Matrix"))
 							.IsEnabled(this, &SDataAssetManagerWidget::CanOpenSelectedAssetsInPropertyEditor)
-							.OnClicked_Lambda([this]()
+							.OnClicked_Lambda([this]() 
 								{
 									OpenSelectionInPropertyMatrix();
 									return FReply::Handled();
@@ -248,7 +248,7 @@ void SDataAssetManagerWidget::Construct(const FArguments& InArgs)
 				.Text(FText::FromString(TEXT("Select DataAsset")))
 				.Font(BigFont)
 				.ColorAndOpacity(FLinearColor::White)
-				.Visibility_Lambda([this]()
+				.Visibility_Lambda([this]() 
 					{
 						return IsDetailsViewEmpty()
 						? EVisibility::Visible
@@ -262,7 +262,7 @@ void SDataAssetManagerWidget::Construct(const FArguments& InArgs)
 	ToolbarButtonsSection->AddSlot()
 		.AutoWidth()
 		.HAlign(HAlign_Center)
-		[
+		[	
 			SNew(SButton)
 			.HAlign(HAlign_Center)
 			.VAlign(VAlign_Center)
@@ -392,8 +392,6 @@ void SDataAssetManagerWidget::CreateNewDataAsset()
 {
 	FDataAssetCreationWindow::Show();
 }
-
-/* clang-format on */
 
 void SDataAssetManagerWidget::OpenSelectedDataAssetInEditor()
 {
@@ -712,6 +710,7 @@ FDetailsViewArgs SDataAssetManagerWidget::CreateDetailsViewArgs() const
 	Args.bShowOptions = true;
 	Args.bShowPropertyMatrixButton = false;
 	Args.bShowDifferingPropertiesOption = true;
+
 	return Args;
 }
 
@@ -1115,10 +1114,14 @@ void SDataAssetManagerWidget::AddColumnToHeader(TSharedPtr<SHeaderRow> InHeaderR
 			.DefaultLabel(FText::FromString(Label))
 			.FillWidth(FillWidth)
 			.HeaderContent()
-				[SNew(SBorder)
-						.BorderBackgroundColor(FSlateColor(FColor::Transparent))
-						.OnMouseButtonDown(this, &SDataAssetManagerWidget::ColumnButtonClicked)
-							[SNew(STextBlock).Text(FText::FromString(Label))]]);
+			[
+				SNew(SBorder)
+				.BorderBackgroundColor(FSlateColor(FColor::Transparent))
+				.OnMouseButtonDown(this, &SDataAssetManagerWidget::ColumnButtonClicked)
+				[
+					SNew(STextBlock).Text(FText::FromString(Label))
+				]
+			]);
 }
 
 const FSlateBrush* SDataAssetManagerWidget::GetRevisionControlColumnIconBadge() const
@@ -1461,10 +1464,14 @@ void SDataAssetManagerWidget::ShowAssetMetaData()
 						.SupportsMinimize(false)
 						.MinWidth(DataAssetManager::MetaDataWindowWidth)
 						.MinHeight(DataAssetManager::MetaDataWindowHeight)
-							[SNew(SBorder)
-									.Padding(4.f)
-									.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
-										[SNew(SMetaDataView, *TagValues)]];
+						[
+							SNew(SBorder)
+							.Padding(4.f)
+							.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+							[
+								SNew(SMetaDataView, *TagValues)
+							]
+						];
 
 				FSlateApplication::Get().AddWindow(Window.ToSharedRef());
 			}
